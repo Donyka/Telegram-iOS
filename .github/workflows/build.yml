@@ -63,6 +63,83 @@ jobs:
           PY
 
       # ============================================================
+      # Disable SiriKit for sideload build
+      #
+      # Free SideStore signing doesn't provide Telegram's original
+      # Siri entitlement. Calling INPreferences.siriAuthorizationStatus()
+      # without it causes an Objective-C exception / SIGABRT.
+      #
+      # We make Telegram behave as if Siri permission was denied.
+      # ============================================================
+
+      - name: Disable SiriKit for sideload
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              "INPreferences.siriAuthorizationStatus()":
+                  "INSiriAuthorizationStatus.denied"
+          }
+
+          patched_files = []
+          total = 0
+
+          roots = [
+              Path("Telegram"),
+              Path("submodules"),
+          ]
+
+          for root in roots:
+              if not root.exists():
+                  continue
+
+              for path in root.rglob("*.swift"):
+                  try:
+                      text = path.read_text(encoding="utf-8")
+                  except (UnicodeDecodeError, OSError):
+                      continue
+
+                  original = text
+                  file_count = 0
+
+                  for needle, replacement in replacements.items():
+                      count = text.count(needle)
+
+                      if count:
+                          text = text.replace(needle, replacement)
+                          total += count
+                          file_count += count
+
+                  if text != original:
+                      path.write_text(text, encoding="utf-8")
+
+                      patched_files.append(
+                          (str(path), file_count)
+                      )
+
+          print("========================================")
+          print("SiriKit sideload patch")
+          print("========================================")
+
+          for path, count in patched_files:
+              print(f"Patched {path}: {count} occurrence(s)")
+
+          print()
+          print(f"Total replacements: {total}")
+
+          if total == 0:
+              raise SystemExit(
+                  "ERROR: INPreferences.siriAuthorizationStatus() "
+                  "was not found. Source may have changed."
+              )
+
+          print("SiriKit authorization status disabled successfully")
+          PY
+
+      # ============================================================
       # Xcode
       # ============================================================
 
@@ -82,13 +159,6 @@ jobs:
 
       # ============================================================
       # Restore Bazel cache
-      #
-      # ВАЖНО:
-      # используем старый prefix:
-      #
-      # swiftgram-bazel-${runner.os}-...
-      #
-      # чтобы предыдущие кеши тоже находились.
       # ============================================================
 
       - name: Restore Bazel cache
@@ -104,7 +174,7 @@ jobs:
             swiftgram-bazel-${{ runner.os }}-
 
       # ============================================================
-      # Проверяем, реально ли приехал кеш
+      # Cache diagnostics
       # ============================================================
 
       - name: Check Bazel cache
@@ -127,7 +197,7 @@ jobs:
           echo
 
           if [ -d "/Users/Shared/bazel-disk-cache" ]; then
-            echo "Cache directory exists."
+            echo "Cache directory exists"
 
             echo
             echo "Cache size:"
@@ -143,7 +213,7 @@ jobs:
           echo "========================================"
 
       # ============================================================
-      # Canonical Telegram source directory
+      # Canonical source directory
       # ============================================================
 
       - name: Create canonical source directory
@@ -178,10 +248,6 @@ jobs:
 
           mkdir -p "$BAZEL_CACHE"
 
-          # --------------------------------------------------------
-          # Build number
-          # --------------------------------------------------------
-
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
 
           APP_VERSION=$(python3 -c \
@@ -199,21 +265,13 @@ jobs:
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
 
-          # --------------------------------------------------------
-          # Fake codesigning
-          # --------------------------------------------------------
-
+          # Fake codesigning.
+          # SideStore will re-sign the resulting IPA.
           python3 \
             build-system/Make/ImportCertificates.py \
             --path build-system/fake-codesigning/certs
 
-          # --------------------------------------------------------
           # Build Swiftgram
-          #
-          # --cacheDir заставляет Bazel использовать persistent
-          # disk cache, который мы восстановили выше.
-          # --------------------------------------------------------
-
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --cacheDir="$BAZEL_CACHE" \
@@ -223,9 +281,9 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # --------------------------------------------------------
+          # ========================================================
           # Collect IPA
-          # --------------------------------------------------------
+          # ========================================================
 
           OUTPUT_PATH="build/artifacts"
 
@@ -233,7 +291,7 @@ jobs:
           mkdir -p "$OUTPUT_PATH"
 
           if [ ! -f "bazel-bin/Telegram/Swiftgram.ipa" ]; then
-            echo "ERROR: Swiftgram.ipa not found!"
+            echo "ERROR: Swiftgram.ipa not found"
             exit 1
           fi
 
@@ -253,10 +311,7 @@ jobs:
           du -sh "$BAZEL_CACHE" || true
 
       # ============================================================
-      # Сначала сохраняем IPA.
-      #
-      # Даже если cache save или Release потом сломается,
-      # готовая IPA уже будет доступна.
+      # Upload IPA first
       # ============================================================
 
       - name: Upload IPA as artifact
@@ -270,11 +325,6 @@ jobs:
 
       # ============================================================
       # Save updated Bazel cache
-      #
-      # Если восстановился cache предыдущего commit —
-      # мы сохраняем обновлённый cache уже под текущим SHA.
-      #
-      # Если exact cache hit — повторно сохранять его нет смысла.
       # ============================================================
 
       - name: Save Bazel cache
@@ -289,7 +339,7 @@ jobs:
           key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
 
       # ============================================================
-      # Release
+      # GitHub Release
       # ============================================================
 
       - name: Create GitHub Release
@@ -301,13 +351,16 @@ jobs:
           name: Swiftgram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
 
           body: |
-            Personal Swiftgram build.
+            Personal Swiftgram sideload build.
 
             Version: ${{ env.APP_VERSION }}
             Build: ${{ env.BUILD_NUMBER }}
 
             Custom Telegram API credentials are injected
-            from GitHub Actions Secrets during the build.
+            from GitHub Actions Secrets.
+
+            CloudKit fallback disabled.
+            SiriKit authorization disabled for sideload compatibility.
 
           files: |
             /Users/Shared/telegram-ios/build/artifacts/Swiftgram.ipa
