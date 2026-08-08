@@ -1,0 +1,33 @@
+{
+  "name": "Donyka Swiftgram",
+  "identifier": "io.github.donyka.swiftgram",
+  "sourceURL": "https://raw.githubusercontent.com/Donyka/Telegram-iOS/master/apps.json",
+  "apps": [
+    {
+      "name": "Swiftgram",
+      "bundleIdentifier": "ph.telegra.Telegraph",
+      "developerName": "Donyka",
+      "subtitle": "Personal Swiftgram sideload build",
+      "localizedDescription": "Personal Swiftgram build based on Telegram for iOS and Swiftgram.",
+      "iconURL": "https://github.com/Donyka.png?size=512",
+      "tintColor": "2AABEE",
+      "category": "social",
+      "version": "12.9.2",
+      "buildVersion": "34495",
+      "versionDate": "2026-08-08T17:47:55.499Z",
+      "versionDescription": "Swiftgram 12.9.2 build 34495",
+      "downloadURL": "https://github.com/Donyka/Telegram-iOS/releases/download/build-34495/Swiftgram.ipa",
+      "size": 81298310,
+      "versions": [
+        {
+          "version": "12.9.2",
+          "buildVersion": "34495",
+          "date": "2026-08-08T17:47:55.499Z",
+          "localizedDescription": "Swiftgram 12.9.2 build 34495",
+          "downloadURL": "https://github.com/Donyka/Telegram-iOS/releases/download/build-34495/Swiftgram.ipa",
+          "size": 81298310
+        }
+      ]
+    }
+  ]
+}
