@@ -104,28 +104,6 @@ public final class CloudDataContextImpl: CloudDataContext {
     }
     
     public func get(phoneNumber: Signal<String?, NoError>) -> Signal<MTBackupDatacenterData, NoError> {
-        let encryptionProvider = self.encryptionProvider
-        return phoneNumber
-        |> take(1)
-        |> mapToSignal { phoneNumber -> Signal<MTBackupDatacenterData, NoError> in
-            var prefix = ""
-            if let phoneNumber = phoneNumber, phoneNumber.count >= 1 {
-                prefix = String(phoneNumber[phoneNumber.startIndex ..< phoneNumber.index(after: phoneNumber.startIndex)])
-            }
-            return Signal { subscriber in
-                let disposable = MetaDisposable()
-                self.impl.with { impl in
-                    disposable.set(impl.get(prefix: prefix).start(next: { data in
-                        if let data = data, let datacenterData = MTIPDataDecode(encryptionProvider, data, phoneNumber ?? "") {
-                            subscriber.putNext(datacenterData)
-                            subscriber.putCompletion()
-                        } else {
-                            subscriber.putCompletion()
-                        }
-                    }))
-                }
-                return disposable
-            }
-        }
+        return .complete()
     }
 }
