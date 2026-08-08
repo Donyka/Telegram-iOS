@@ -63,13 +63,16 @@ jobs:
           PY
 
       # ============================================================
-      # Disable SiriKit for sideload build
+      # Disable SiriKit for sideload
       #
-      # Free SideStore signing doesn't provide Telegram's original
-      # Siri entitlement. Calling INPreferences.siriAuthorizationStatus()
-      # without it causes an Objective-C exception / SIGABRT.
+      # Вместо:
       #
-      # We make Telegram behave as if Siri permission was denied.
+      # INPreferences.requestSiriAuthorization(...)
+      # INPreferences.siriAuthorizationStatus()
+      #
+      # полностью заставляем Telegram считать Siri недоступной.
+      #
+      # Это важно для SideStore signing без Siri entitlement.
       # ============================================================
 
       - name: Disable SiriKit for sideload
@@ -79,64 +82,88 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          replacements = {
-              "INPreferences.siriAuthorizationStatus()":
-                  "INSiriAuthorizationStatus.denied"
-          }
+          path = Path("submodules/TelegramUI/Sources/AppDelegate.swift")
 
-          patched_files = []
-          total = 0
+          if not path.exists():
+              raise SystemExit(
+                  f"ERROR: {path} does not exist"
+              )
 
-          roots = [
-              Path("Telegram"),
-              Path("submodules"),
-          ]
+          text = path.read_text(encoding="utf-8")
 
-          for root in roots:
-              if not root.exists():
-                  continue
+          start_marker = (
+              "        }, requestSiriAuthorization: { completion in\n"
+          )
 
-              for path in root.rglob("*.swift"):
-                  try:
-                      text = path.read_text(encoding="utf-8")
-                  except (UnicodeDecodeError, OSError):
-                      continue
+          end_marker = (
+              "        }, getWindowHost: {\n"
+          )
 
-                  original = text
-                  file_count = 0
+          start = text.find(start_marker)
 
-                  for needle, replacement in replacements.items():
-                      count = text.count(needle)
+          if start == -1:
+              raise SystemExit(
+                  "ERROR: requestSiriAuthorization block not found"
+              )
 
-                      if count:
-                          text = text.replace(needle, replacement)
-                          total += count
-                          file_count += count
+          end = text.find(end_marker, start)
 
-                  if text != original:
-                      path.write_text(text, encoding="utf-8")
+          if end == -1:
+              raise SystemExit(
+                  "ERROR: getWindowHost marker not found"
+              )
 
-                      patched_files.append(
-                          (str(path), file_count)
-                      )
+          old_block = text[start:end]
+
+          # Safety check: убеждаемся, что патчим именно ожидаемый блок.
+          if "INPreferences.requestSiriAuthorization" not in old_block:
+              raise SystemExit(
+                  "ERROR: Siri request API missing from expected block"
+              )
+
+          if "INPreferences.siriAuthorizationStatus()" not in old_block:
+              raise SystemExit(
+                  "ERROR: Siri status API missing from expected block"
+              )
+
+          replacement = (
+              "        }, requestSiriAuthorization: { completion in\n"
+              "            completion(false)\n"
+              "        }, siriAuthorization: {\n"
+              "            return .denied\n"
+          )
+
+          text = text[:start] + replacement + text[end:]
+
+          path.write_text(text, encoding="utf-8")
+
+          # Verify dangerous calls are gone from this block.
+          updated = path.read_text(encoding="utf-8")
+
+          new_start = updated.find(start_marker)
+          new_end = updated.find(end_marker, new_start)
+
+          new_block = updated[new_start:new_end]
+
+          if "INPreferences.requestSiriAuthorization" in new_block:
+              raise SystemExit(
+                  "ERROR: requestSiriAuthorization call still present"
+              )
+
+          if "INPreferences.siriAuthorizationStatus()" in new_block:
+              raise SystemExit(
+                  "ERROR: siriAuthorizationStatus call still present"
+              )
 
           print("========================================")
           print("SiriKit sideload patch")
           print("========================================")
-
-          for path, count in patched_files:
-              print(f"Patched {path}: {count} occurrence(s)")
-
+          print(f"Patched: {path}")
           print()
-          print(f"Total replacements: {total}")
-
-          if total == 0:
-              raise SystemExit(
-                  "ERROR: INPreferences.siriAuthorizationStatus() "
-                  "was not found. Source may have changed."
-              )
-
-          print("SiriKit authorization status disabled successfully")
+          print("requestSiriAuthorization -> completion(false)")
+          print("siriAuthorization        -> .denied")
+          print()
+          print("SiriKit disabled successfully")
           PY
 
       # ============================================================
@@ -174,7 +201,7 @@ jobs:
             swiftgram-bazel-${{ runner.os }}-
 
       # ============================================================
-      # Cache diagnostics
+      # Bazel cache diagnostics
       # ============================================================
 
       - name: Check Bazel cache
@@ -204,7 +231,7 @@ jobs:
             du -sh /Users/Shared/bazel-disk-cache || true
 
             echo
-            echo "Number of cache files:"
+            echo "Cache files:"
             find /Users/Shared/bazel-disk-cache -type f | wc -l
           else
             echo "NO BAZEL CACHE RESTORED"
@@ -265,13 +292,18 @@ jobs:
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
 
-          # Fake codesigning.
-          # SideStore will re-sign the resulting IPA.
+          # --------------------------------------------------------
+          # Fake signing certificates
+          # --------------------------------------------------------
+
           python3 \
             build-system/Make/ImportCertificates.py \
             --path build-system/fake-codesigning/certs
 
+          # --------------------------------------------------------
           # Build Swiftgram
+          # --------------------------------------------------------
+
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --cacheDir="$BAZEL_CACHE" \
@@ -281,43 +313,53 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # ========================================================
+          # --------------------------------------------------------
           # Collect IPA
-          # ========================================================
+          # --------------------------------------------------------
 
           OUTPUT_PATH="build/artifacts"
 
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
 
-          if [ ! -f "bazel-bin/Telegram/Swiftgram.ipa" ]; then
+          IPA_SOURCE="bazel-bin/Telegram/Swiftgram.ipa"
+          IPA_OUTPUT="$OUTPUT_PATH/Swiftgram.ipa"
+
+          if [ ! -f "$IPA_SOURCE" ]; then
             echo "ERROR: Swiftgram.ipa not found"
             exit 1
           fi
 
-          cp \
-            bazel-bin/Telegram/Swiftgram.ipa \
-            "$OUTPUT_PATH/Swiftgram.ipa"
+          cp "$IPA_SOURCE" "$IPA_OUTPUT"
+
+          IPA_SIZE=$(stat -f%z "$IPA_OUTPUT")
+
+          echo "IPA_SIZE=$IPA_SIZE" >> "$GITHUB_ENV"
 
           echo
           echo "========================================"
           echo "Swiftgram successfully built"
           echo "========================================"
 
-          ls -lh "$OUTPUT_PATH/Swiftgram.ipa"
+          ls -lh "$IPA_OUTPUT"
+
+          echo
+          echo "IPA size in bytes:"
+          echo "$IPA_SIZE"
 
           echo
           echo "Bazel cache after build:"
           du -sh "$BAZEL_CACHE" || true
 
       # ============================================================
-      # Upload IPA first
+      # Upload IPA as GitHub Actions artifact
       # ============================================================
 
       - name: Upload IPA as artifact
         if: steps.build_app.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
+          name: Swiftgram-${{ env.BUILD_NUMBER }}
           path: /Users/Shared/telegram-ios/build/artifacts/Swiftgram.ipa
           if-no-files-found: error
           retention-days: 30
@@ -356,11 +398,172 @@ jobs:
             Version: ${{ env.APP_VERSION }}
             Build: ${{ env.BUILD_NUMBER }}
 
-            Custom Telegram API credentials are injected
-            from GitHub Actions Secrets.
+            Telegram API credentials injected from GitHub Secrets.
 
-            CloudKit fallback disabled.
-            SiriKit authorization disabled for sideload compatibility.
+            Sideload compatibility:
+            - CloudKit fallback disabled
+            - SiriKit disabled
 
           files: |
             /Users/Shared/telegram-ios/build/artifacts/Swiftgram.ipa
+
+      # ============================================================
+      # Update SideStore source
+      #
+      # Создаёт/обновляет apps.json в репозитории.
+      #
+      # IPA берётся напрямую из GitHub Release.
+      # ============================================================
+
+      - name: Update SideStore source
+        if: steps.build_app.outcome == 'success'
+        uses: actions/github-script@v9
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          IPA_SIZE: ${{ env.IPA_SIZE }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        with:
+          script: |
+            const appVersion = process.env.APP_VERSION;
+            const buildNumber = process.env.BUILD_NUMBER;
+            const ipaSize = Number(process.env.IPA_SIZE);
+            const branch = process.env.TARGET_BRANCH;
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const repositoryURL =
+              `https://github.com/${owner}/${repo}`;
+
+            const sourceURL =
+              `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/apps.json`;
+
+            const downloadURL =
+              `${repositoryURL}/releases/download/build-${buildNumber}/Swiftgram.ipa`;
+
+            const iconURL =
+              `https://github.com/${owner}.png?size=512`;
+
+            const now = new Date().toISOString();
+
+            const source = {
+              name: "Donyka Swiftgram",
+              identifier: "io.github.donyka.swiftgram",
+              sourceURL: sourceURL,
+
+              apps: [
+                {
+                  name: "Swiftgram",
+
+                  bundleIdentifier: "ph.telegra.Telegraph",
+
+                  developerName: "Donyka",
+
+                  subtitle:
+                    "Personal Swiftgram sideload build",
+
+                  localizedDescription:
+                    "Personal Swiftgram build based on Telegram for iOS and Swiftgram.",
+
+                  iconURL: iconURL,
+
+                  tintColor: "2AABEE",
+
+                  category: "social",
+
+                  version: appVersion,
+
+                  buildVersion: buildNumber,
+
+                  versionDate: now,
+
+                  versionDescription:
+                    `Swiftgram ${appVersion} build ${buildNumber}`,
+
+                  downloadURL: downloadURL,
+
+                  size: ipaSize,
+
+                  versions: [
+                    {
+                      version: appVersion,
+
+                      buildVersion: buildNumber,
+
+                      date: now,
+
+                      localizedDescription:
+                        `Swiftgram ${appVersion} build ${buildNumber}`,
+
+                      downloadURL: downloadURL,
+
+                      size: ipaSize
+                    }
+                  ]
+                }
+              ]
+            };
+
+            const json =
+              JSON.stringify(source, null, 2) + "\n";
+
+            const content =
+              Buffer
+                .from(json)
+                .toString("base64");
+
+            let existingSha;
+
+            try {
+              const existing =
+                await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: "apps.json",
+                  ref: branch
+                });
+
+              if (!Array.isArray(existing.data)) {
+                existingSha = existing.data.sha;
+              }
+
+              console.log(
+                "Existing apps.json found"
+              );
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              console.log(
+                "apps.json does not exist yet; creating it"
+              );
+            }
+
+            const args = {
+              owner,
+              repo,
+              path: "apps.json",
+
+              message:
+                `Update SideStore source to ${appVersion} (${buildNumber})`,
+
+              content,
+              branch
+            };
+
+            if (existingSha) {
+              args.sha = existingSha;
+            }
+
+            await github.rest.repos.createOrUpdateFileContents(args);
+
+            console.log("========================================");
+            console.log("SideStore source updated");
+            console.log("========================================");
+            console.log(`Version: ${appVersion}`);
+            console.log(`Build: ${buildNumber}`);
+            console.log(`IPA size: ${ipaSize}`);
+            console.log(`Download: ${downloadURL}`);
+            console.log(`Source: ${sourceURL}`);
