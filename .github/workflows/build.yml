@@ -23,12 +23,6 @@ jobs:
 
       # ============================================================
       # Telegram API credentials
-      #
-      # Берём из:
-      # Settings -> Secrets and variables -> Actions
-      #
-      # TG_API_ID
-      # TG_API_HASH
       # ============================================================
 
       - name: Configure Telegram API credentials
@@ -63,9 +57,9 @@ jobs:
               json.dump(config, f, indent=4)
               f.write("\n")
 
-          print("Telegram API credentials configured successfully")
-          print("api_id length:", len(api_id))
-          print("api_hash length:", len(api_hash))
+          print("Telegram API credentials configured")
+          print("API ID length:", len(api_id))
+          print("API hash length:", len(api_hash))
           PY
 
       # ============================================================
@@ -79,7 +73,7 @@ jobs:
           XCODE_VERSION=$(python3 -c \
             'import json; print(json.load(open("versions.json"))["xcode"])')
 
-          echo "Using Xcode: $XCODE_VERSION"
+          echo "Using Xcode $XCODE_VERSION"
 
           sudo xcode-select -s \
             "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
@@ -87,10 +81,14 @@ jobs:
           xcodebuild -version
 
       # ============================================================
-      # Restore Bazel disk cache
+      # Restore Bazel cache
       #
-      # Точный SHA -> отдельный snapshot.
-      # Для нового commit restore-keys подхватит предыдущий cache.
+      # ВАЖНО:
+      # используем старый prefix:
+      #
+      # swiftgram-bazel-${runner.os}-...
+      #
+      # чтобы предыдущие кеши тоже находились.
       # ============================================================
 
       - name: Restore Bazel cache
@@ -98,13 +96,54 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /Users/Shared/bazel-disk-cache
-          key: swiftgram-bazel-macos26-${{ hashFiles('versions.json') }}-${{ github.sha }}
+
+          key: swiftgram-bazel-${{ runner.os }}-${{ hashFiles('versions.json') }}-${{ github.sha }}
+
           restore-keys: |
-            swiftgram-bazel-macos26-${{ hashFiles('versions.json') }}-
-            swiftgram-bazel-macos26-
+            swiftgram-bazel-${{ runner.os }}-${{ hashFiles('versions.json') }}-
+            swiftgram-bazel-${{ runner.os }}-
 
       # ============================================================
-      # Canonical source directory
+      # Проверяем, реально ли приехал кеш
+      # ============================================================
+
+      - name: Check Bazel cache
+        run: |
+          echo "========================================"
+          echo "Bazel cache diagnostics"
+          echo "========================================"
+
+          echo "Exact cache hit:"
+          echo "${{ steps.bazel-cache.outputs.cache-hit }}"
+
+          echo
+          echo "Matched cache key:"
+          echo "${{ steps.bazel-cache.outputs.cache-matched-key }}"
+
+          echo
+          echo "Primary cache key:"
+          echo "${{ steps.bazel-cache.outputs.cache-primary-key }}"
+
+          echo
+
+          if [ -d "/Users/Shared/bazel-disk-cache" ]; then
+            echo "Cache directory exists."
+
+            echo
+            echo "Cache size:"
+            du -sh /Users/Shared/bazel-disk-cache || true
+
+            echo
+            echo "Number of cache files:"
+            find /Users/Shared/bazel-disk-cache -type f | wc -l
+          else
+            echo "NO BAZEL CACHE RESTORED"
+          fi
+
+          echo "========================================"
+
+      # ============================================================
+      # Canonical Telegram source directory
       # ============================================================
 
       - name: Create canonical source directory
@@ -114,10 +153,12 @@ jobs:
           sudo rm -rf /Users/Shared/telegram-ios
           sudo mkdir -p /Users/Shared/telegram-ios
 
-          sudo cp -R "$GITHUB_WORKSPACE/." \
+          sudo cp -R \
+            "$GITHUB_WORKSPACE/." \
             /Users/Shared/telegram-ios/
 
-          sudo chown -R "$(whoami)" \
+          sudo chown -R \
+            "$(whoami)" \
             /Users/Shared/telegram-ios
 
       # ============================================================
@@ -137,6 +178,10 @@ jobs:
 
           mkdir -p "$BAZEL_CACHE"
 
+          # --------------------------------------------------------
+          # Build number
+          # --------------------------------------------------------
+
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
 
           APP_VERSION=$(python3 -c \
@@ -146,19 +191,29 @@ jobs:
 
           BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
 
+          echo "========================================"
           echo "APP_VERSION=$APP_VERSION"
           echo "BUILD_NUMBER=$BUILD_NUMBER"
+          echo "========================================"
 
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
 
-          # Fake signing certificates.
-          # SideStore потом переподпишет IPA твоим Apple ID.
+          # --------------------------------------------------------
+          # Fake codesigning
+          # --------------------------------------------------------
+
           python3 \
             build-system/Make/ImportCertificates.py \
             --path build-system/fake-codesigning/certs
 
-          # Build Swiftgram.
+          # --------------------------------------------------------
+          # Build Swiftgram
+          #
+          # --cacheDir заставляет Bazel использовать persistent
+          # disk cache, который мы восстановили выше.
+          # --------------------------------------------------------
+
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --cacheDir="$BAZEL_CACHE" \
@@ -168,14 +223,19 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # ========================================================
+          # --------------------------------------------------------
           # Collect IPA
-          # ========================================================
+          # --------------------------------------------------------
 
           OUTPUT_PATH="build/artifacts"
 
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
+
+          if [ ! -f "bazel-bin/Telegram/Swiftgram.ipa" ]; then
+            echo "ERROR: Swiftgram.ipa not found!"
+            exit 1
+          fi
 
           cp \
             bazel-bin/Telegram/Swiftgram.ipa \
@@ -183,45 +243,53 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Swiftgram build completed successfully"
+          echo "Swiftgram successfully built"
           echo "========================================"
 
           ls -lh "$OUTPUT_PATH/Swiftgram.ipa"
 
+          echo
+          echo "Bazel cache after build:"
+          du -sh "$BAZEL_CACHE" || true
+
       # ============================================================
-      # СНАЧАЛА сохраняем IPA.
+      # Сначала сохраняем IPA.
       #
-      # Поэтому даже если cache/release потом сломается,
-      # собранный файл уже будет в GitHub Actions.
+      # Даже если cache save или Release потом сломается,
+      # готовая IPA уже будет доступна.
       # ============================================================
 
       - name: Upload IPA as artifact
+        if: steps.build_app.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           path: /Users/Shared/telegram-ios/build/artifacts/Swiftgram.ipa
           if-no-files-found: error
           retention-days: 30
-
-          # Для одного IPA не создаём ещё один zip поверх него.
           archive: false
 
       # ============================================================
-      # Save Bazel cache
+      # Save updated Bazel cache
       #
-      # Если cache-сервис упадёт или cache окажется слишком большим,
-      # сам workflow из-за этого не запорется.
+      # Если восстановился cache предыдущего commit —
+      # мы сохраняем обновлённый cache уже под текущим SHA.
+      #
+      # Если exact cache hit — повторно сохранять его нет смысла.
       # ============================================================
 
       - name: Save Bazel cache
-        if: always() && steps.build_app.outcome == 'success' && steps.bazel-cache.outputs.cache-hit != 'true'
+        if: >
+          always() &&
+          steps.build_app.outcome == 'success' &&
+          steps.bazel-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
           path: /Users/Shared/bazel-disk-cache
-          key: swiftgram-bazel-macos26-${{ hashFiles('versions.json') }}-${{ github.sha }}
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
 
       # ============================================================
-      # GitHub Release
+      # Release
       # ============================================================
 
       - name: Create GitHub Release
@@ -229,6 +297,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ env.BUILD_NUMBER }}
+
           name: Swiftgram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
 
           body: |
@@ -237,7 +306,8 @@ jobs:
             Version: ${{ env.APP_VERSION }}
             Build: ${{ env.BUILD_NUMBER }}
 
-            Built with custom Telegram API credentials.
+            Custom Telegram API credentials are injected
+            from GitHub Actions Secrets during the build.
 
           files: |
             /Users/Shared/telegram-ios/build/artifacts/Swiftgram.ipa
